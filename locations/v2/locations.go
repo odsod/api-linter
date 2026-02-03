@@ -25,26 +25,40 @@ package locations
 import (
 	"sync"
 
-	"github.com/jhump/protoreflect/desc"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	dpb "google.golang.org/protobuf/types/descriptorpb"
 )
 
 // pathLocation returns the precise location for a given descriptor and path.
 // It combines the path of the descriptor itself with any path provided appended.
-func pathLocation(d desc.Descriptor, path ...int) *dpb.SourceCodeInfo_Location {
-	fullPath := d.GetSourceInfo().GetPath()
+func pathLocation(d protoreflect.Descriptor, path ...int) *dpb.SourceCodeInfo_Location {
+	fullPath := d.ParentFile().SourceLocations().ByDescriptor(d).Path
 	for _, i := range path {
 		fullPath = append(fullPath, int32(i))
 	}
-	return sourceInfoRegistry.sourceInfo(d.GetFile()).findLocation(fullPath)
+	return sourceInfoRegistry.sourceInfo(d.ParentFile()).findLocation(fullPath)
 }
 
-type sourceInfo map[string]*dpb.SourceCodeInfo_Location
+type sourceInfo struct {
+	// infoMu protects the info map
+	infoMu sync.Mutex
+	info   map[string]*dpb.SourceCodeInfo_Location
+}
+
+func newSourceInfo() *sourceInfo {
+	return &sourceInfo{
+		info: map[string]*dpb.SourceCodeInfo_Location{},
+	}
+}
 
 // findLocation returns the Location for a given path.
-func (si sourceInfo) findLocation(path []int32) *dpb.SourceCodeInfo_Location {
+func (si *sourceInfo) findLocation(path []int32) *dpb.SourceCodeInfo_Location {
+	si.infoMu.Lock()
+	defer si.infoMu.Unlock()
+
 	// If the path exists in the source info registry, return that object.
-	if loc, ok := si[strPath(path)]; ok {
+	if loc, ok := si.info[strPath(path)]; ok {
 		return loc
 	}
 
@@ -56,8 +70,15 @@ func (si sourceInfo) findLocation(path []int32) *dpb.SourceCodeInfo_Location {
 // any file descriptor that it is given, but then caches it to avoid computing
 // the source map for the same file descriptors over and over.
 type sourceInfoRegistryType struct {
-	m  map[*desc.FileDescriptor]sourceInfo
-	mu sync.RWMutex
+	// registryMu protects the registry map
+	registryMu sync.Mutex
+	registry   map[protoreflect.FileDescriptor]*sourceInfo
+}
+
+func newSourceInfoRegistryType() *sourceInfoRegistryType {
+	return &sourceInfoRegistryType{
+		registry: map[protoreflect.FileDescriptor]*sourceInfo{},
+	}
 }
 
 // Each location has a path defined as an []int32, but we can not
@@ -75,37 +96,24 @@ func strPath(segments []int32) (p string) {
 // sourceInfo compiles the source info object for a given file descriptor.
 // It also caches this into a registry, so subsequent calls using the same
 // descriptor will return the same object.
-func (sir *sourceInfoRegistryType) sourceInfo(fd *desc.FileDescriptor) sourceInfo {
-	sir.mu.RLock()
-	answer, ok := sir.m[fd]
-	sir.mu.RUnlock()
-	if ok {
-		return answer
+func (sir *sourceInfoRegistryType) sourceInfo(fd protoreflect.FileDescriptor) *sourceInfo {
+	sir.registryMu.Lock()
+	defer sir.registryMu.Unlock()
+	answer, ok := sir.registry[fd]
+	if !ok {
+		answer = newSourceInfo()
+
+		// This file descriptor does not yet have a source info map.
+		// Compile one.
+		for _, loc := range protodesc.ToFileDescriptorProto(fd).GetSourceCodeInfo().GetLocation() {
+			answer.info[strPath(loc.Path)] = loc
+		}
+
+		// Now that we calculated all of this, cache it on the registry so it
+		// does not need to be calculated again.
+		sir.registry[fd] = answer
 	}
-
-	sir.mu.Lock()
-	defer sir.mu.Unlock()
-
-	// Double-check locking pattern.
-	if answer, ok = sir.m[fd]; ok {
-		return answer
-	}
-
-	answer = sourceInfo{}
-
-	// This file descriptor does not yet have a source info map.
-	// Compile one.
-	for _, loc := range fd.AsFileDescriptorProto().GetSourceCodeInfo().GetLocation() {
-		answer[strPath(loc.Path)] = loc
-	}
-
-	// Now that we calculated all of this, cache it on the registry so it
-	// does not need to be calculated again.
-	sir.m[fd] = answer
-
 	return answer
 }
 
-var sourceInfoRegistry = &sourceInfoRegistryType{
-	m: make(map[*desc.FileDescriptor]sourceInfo),
-}
+var sourceInfoRegistry = newSourceInfoRegistryType()

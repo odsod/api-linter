@@ -20,15 +20,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/aep-dev/api-linter/internal"
 	"github.com/aep-dev/api-linter/lint"
-	"github.com/jhump/protoreflect/desc"
-	"github.com/jhump/protoreflect/desc/protoparse"
+	lint_v2 "github.com/aep-dev/api-linter/lint/v2"
 	"github.com/spf13/pflag"
-	"google.golang.org/protobuf/proto"
-	dpb "google.golang.org/protobuf/types/descriptorpb"
 	"gopkg.in/yaml.v2"
 )
 
@@ -106,7 +102,7 @@ func newCli(args []string) *cli {
 	}
 }
 
-func (c *cli) lint(rules lint.RuleRegistry, configs lint.Configs) error {
+func (c *cli) lint(rules lint.RuleRegistry, rulesV2 lint_v2.RuleRegistry, configs lint.Configs) error {
 	// Print version and exit if asked.
 	if c.VersionFlag {
 		fmt.Printf("api-linter %s\n", internal.Version)
@@ -137,60 +133,32 @@ func (c *cli) lint(rules lint.RuleRegistry, configs lint.Configs) error {
 	configs = append(configs, lint.Config{
 		DisabledRules: c.DisabledRules,
 	})
-	// Prepare proto import lookup.
-	fs, err := loadFileDescriptors(c.ProtoDescPath...)
+
+	// V1 Pipeline
+	resultsV1, err := c.runV1(rules, configs)
 	if err != nil {
-		return err
-	}
-	lookupImport := func(name string) (*desc.FileDescriptor, error) {
-		if f, found := fs[name]; found {
-			return f, nil
-		}
-		return nil, fmt.Errorf("%q is not found", name)
-	}
-	var errorsWithPos []protoparse.ErrorWithPos
-	var lock sync.Mutex
-	// Parse proto files into `protoreflect` file descriptors.
-	p := protoparse.Parser{
-		ImportPaths:           c.ProtoImportPaths,
-		IncludeSourceCodeInfo: true,
-		LookupImport:          lookupImport,
-		ErrorReporter: func(errorWithPos protoparse.ErrorWithPos) error {
-			// Protoparse isn't concurrent right now but just to be safe for the future.
-			lock.Lock()
-			errorsWithPos = append(errorsWithPos, errorWithPos)
-			lock.Unlock()
-			// Continue parsing. The error returned will be protoparse.ErrInvalidSource.
-			return nil
-		},
-	}
-	// Resolve file absolute paths to relative ones.
-	protoFiles, err := protoparse.ResolveFilenames(c.ProtoImportPaths, c.ProtoFiles...)
-	if err != nil {
-		return err
-	}
-	fd, err := p.ParseFiles(protoFiles...)
-	if err != nil {
-		if err == protoparse.ErrInvalidSource {
-			if len(errorsWithPos) == 0 {
-				return errors.New("got protoparse.ErrInvalidSource but no ErrorWithPos errors")
-			}
-			// TODO: There's multiple ways to deal with this but this prints all the errors at least
-			errStrings := make([]string, len(errorsWithPos))
-			for i, errorWithPos := range errorsWithPos {
-				errStrings[i] = errorWithPos.Error()
-			}
-			return errors.New(strings.Join(errStrings, "\n"))
-		}
 		return err
 	}
 
-	// Create a linter to lint the file descriptors.
-	l := lint.New(rules, configs, lint.Debug(c.DebugFlag), lint.IgnoreCommentDisables(c.IgnoreCommentDisablesFlag))
-	results, err := l.LintProtos(fd...)
-	if err != nil {
-		return err
+	// V2 Pipeline
+	// Note: We convert V1 configs to V2 configs. Since they are identical in structure,
+	// we just cast or copy. For PoC, let's assume they are compatible or just use empty.
+	var configsV2 lint_v2.Configs
+	for _, cfg := range configs {
+		configsV2 = append(configsV2, lint_v2.Config{
+			EnabledRules:  cfg.EnabledRules,
+			DisabledRules: cfg.DisabledRules,
+		})
 	}
+	resultsV2, err := c.runV2(rulesV2, configsV2)
+	if err != nil {
+		// Log V2 failure but don't stop V1?
+		// Actually, let's return error for now to be safe.
+		return fmt.Errorf("V2 pipeline failed: %w", err)
+	}
+
+	// Merge Results
+	results := mergeResponses(resultsV1, resultsV2)
 
 	// Determine the output for writing the results.
 	// Stdout is the default output.
@@ -219,44 +187,22 @@ func (c *cli) lint(rules lint.RuleRegistry, configs lint.Configs) error {
 
 	// Return error on lint failure which subsequently
 	// exits with a non-zero status code
-	if c.ExitStatusOnLintFailure && anyProblems(results) {
+	if c.ExitStatusOnLintFailure && anyProblemsInMerged(results) {
 		return ExitForLintFailure
 	}
 
 	return nil
 }
 
-func anyProblems(results []lint.Response) bool {
-	for i := range results {
-		if len(results[i].Problems) > 0 {
-			return true
+func anyProblemsInMerged(results []interface{}) bool {
+	for _, r := range results {
+		if ur, ok := r.(*unifiedResponse); ok {
+			if len(ur.Problems) > 0 {
+				return true
+			}
 		}
 	}
 	return false
-}
-
-func loadFileDescriptors(filePaths ...string) (map[string]*desc.FileDescriptor, error) {
-	fds := []*dpb.FileDescriptorProto{}
-	for _, filePath := range filePaths {
-		fs, err := readFileDescriptorSet(filePath)
-		if err != nil {
-			return nil, err
-		}
-		fds = append(fds, fs.GetFile()...)
-	}
-	return desc.CreateFileDescriptors(fds)
-}
-
-func readFileDescriptorSet(filePath string) (*dpb.FileDescriptorSet, error) {
-	in, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, err
-	}
-	fs := &dpb.FileDescriptorSet{}
-	if err := proto.Unmarshal(in, fs); err != nil {
-		return nil, err
-	}
-	return fs, nil
 }
 
 var outputFormatFuncs = map[string]formatFunc{

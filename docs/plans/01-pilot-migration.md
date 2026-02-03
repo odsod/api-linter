@@ -1,54 +1,58 @@
-# Plan: Pilot V2 Rule Migration
+# Plan: Pilot Dual Stack Migration
 
-**Goal:** Implement the infrastructure for V2 (protoreflect) rules and migrate **one** pilot rule (`aep0122/no-self-links`) to prove the concept in a single, shippable commit.
+**Goal:** Establish the V2 pipeline and migrate the first rule (`aep0122`) using the "Dual Stack via Vendoring" strategy.
 
-## 1. Candidate Rule: `aep0122/no-self-links`
-**Why?**
-*   **Simple Logic:** It checks for a single field (`name`) inside a message.
-*   **Minimal Deps:** It only relies on `utils.IsResource`.
-*   **High Value:** It's a standard check, ensuring we don't break core functionality.
+## 1. Preparation
+*   Ensure `original-api-linter` is checked out at commit `42e6805`.
+*   Ensure `go.mod` is updated to include V2 dependencies (`bufbuild/protocompile`, `google.golang.org/protobuf`).
 
-## 2. File Updates Required
+## 2. Infrastructure Setup (The "V2 Core")
+We need to create the V2 packages by vendoring code from upstream.
 
-### A. Core Infrastructure (`lint/`)
+1.  **`internal/v2`**:
+    *   Copy `original-api-linter/internal` -> `internal/v2`.
+    *   *Why:* Contains version info and potentially shared internal logic updated for V2.
+2.  **`lint/v2`**:
+    *   Copy `original-api-linter/lint` -> `lint/v2`.
+    *   *Modifications:* Update imports inside these files to point to `github.com/aep-dev/api-linter/internal/v2` instead of the original path.
+3.  **`rules/v2` (Scaffolding)**:
+    *   Create `rules/v2`.
+    *   Copy `original-api-linter/rules/internal` -> `rules/v2/internal`.
+    *   *Why:* This contains the V2 versions of `utils` (e.g., `IsResource` using `protoreflect`).
 
-1.  **`lint/rule.go`**:
-    *   Add `ProtoRuleV2` interface (accepts `protoreflect.FileDescriptor`).
-    *   Add `MessageRuleV2` struct (implementation for messages).
-    *   *Note:* We don't need to touch `ProtoRule` (V1).
+## 3. Pilot Rule Migration: `aep0122`
 
-2.  **`lint/problem.go`**:
-    *   Add `DescriptorV2 protoreflect.Descriptor` field to `Problem` struct.
-    *   Update methods that use `Descriptor` to fall back to `DescriptorV2` if V1 is nil (e.g., location calculation).
+1.  **Vendor Rule:**
+    *   Copy `original-api-linter/rules/aep0122` -> `rules/v2/aep0122`.
+2.  **Register Rule:**
+    *   Create `rules/v2/rules.go` (based on upstream `rules/rules.go`).
+    *   Register only `aep0122`.
+3.  **Deactivate V1 Rule:**
+    *   Modify `rules/rules.go` (V1) to **remove** `aep0122` registration.
+    *   *Note:* We don't delete the code yet, just unregister it to avoid noise.
 
-3.  **`lint/lint.go`**:
-    *   Update `lintFileDescriptor`:
-        *   Add logic to `UnwrapFile()` (jhump -> protoreflect).
-        *   Add a type switch to the rule loop.
-        *   If `case ProtoRuleV2`: convert descriptor and run.
+## 4. CLI Integration (`cmd/api-linter/cli.go`)
 
-### B. Utilities (`rules/internal/utils/`)
+This is the most complex step. We need to implement the "Second Loop".
 
-4.  **`rules/internal/utils/resource.go`** (or `utils/v2/`):
-    *   Add `IsResource(m protoreflect.MessageDescriptor) bool`.
-    *   *Implementation:* Use `proto.GetExtension` with `protoreflect` options to check for `google.api.resource`.
+1.  **Import V2:** Add imports for `lint/v2` and `rules/v2`.
+2.  **Implement `runV2`:**
+    *   Copy the parsing logic from upstream `cli.go` (using `protocompile`).
+    *   Instantiate `lint_v2.New` with `rules_v2.GlobalRegistry`.
+    *   Run linting.
+3.  **Merge Results:**
+    *   Call `runV1`.
+    *   Call `runV2`.
+    *   Append `problemsV2` to `problemsV1`.
 
-### C. The Rule (`rules/aep0122/`)
+## 5. Verification
 
-5.  **`rules/aep0122/no_self_links.go`**:
-    *   Change variable type: `&lint.MessageRule` -> `&lint.MessageRuleV2`.
-    *   Update `OnlyIf`: Change arg to `protoreflect.MessageDescriptor`.
-    *   Update `LintMessage`: Change logic to use V2 accessors (e.g., `m.Fields().ByName("name")` instead of `m.FindFieldByName("name")`).
+1.  **Build:** Ensure all imports resolve.
+2.  **Test:** Run `api-linter` against a sample proto that violates AIP-122 (Self Links).
+    *   *Expectation:* The error is reported (by the V2 stack).
+3.  **Regression:** Run against other violations.
+    *   *Expectation:* Other errors are reported (by the V1 stack).
 
-6.  **`rules/aep0122/no_self_links_test.go`**:
-    *   *Crucial:* Since the test runner likely uses `lint.Run(rule, descriptor)`, the test code itself might not need drastic changes *if* the Linter adapter works correctly. The adapter should handle the V2 rule even if the test passes in a V1 descriptor (because the linter converts it).
-    *   However, if the test manually calls `rule.LintMessage(...)`, that will break. We need to check if we need to update the test setup to use `lint.LintProtos`.
-
-## 3. Execution Steps
-
-1.  **Prep:** `go get google.golang.org/protobuf` (ensure dependency is current).
-2.  **Core:** Implement `ProtoRuleV2`, `MessageRuleV2`, and `Problem` updates.
-3.  **Engine:** Implement the adapter loop in `lint/lint.go`.
-4.  **Utils:** Port `IsResource` to V2.
-5.  **Migrate:** Rewrite `no_self_links.go`.
-6.  **Verify:** Run `go test ./rules/aep0122/...` to ensure the adapter works.
+## 6. Cleanup
+Once verified:
+*   Delete `rules/aep0122` (V1 code).

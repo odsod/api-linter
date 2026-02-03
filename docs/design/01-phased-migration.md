@@ -1,91 +1,89 @@
-# Design: Phased Migration to Protoreflect V2
+# Design: Dual Stack Migration (Vendoring Strategy)
 
-**Status:** Proposed
-**Goal:** Migrate `api-linter` from `jhump/protoreflect` to `google.golang.org/protobuf/reflect/protoreflect` incrementally, allowing mixed-mode operation.
+**Status:** Approved
+**Goal:** Migrate `api-linter` to `protoreflect` (V2) by running parallel V1 (Legacy) and V2 (Modern) pipelines, gradually moving rules from one to the other.
 
-## 1. The Challenge
-The current `Linter` and `Rule` interfaces are tightly coupled to `jhump/protoreflect`.
-*   **Parsing:** The CLI uses `protoparse` (jhump).
-*   **Rules:** Every rule signature expects `*desc.MessageDescriptor` (jhump).
-*   **Utils:** Helper libraries expect `jhump` types.
+## 1. Strategic Rationale
+Instead of refactoring the existing codebase with complex adapters (Hybrid Approach), we will leverage the fact that the upstream `google/api-linter` repository has already completed this migration in commit `42e6805`.
 
-A "Big Bang" rewrite is too risky for a volunteer team. We need a bridge.
+**Key Benefit:** We can copy-paste production-proven V2 code (`lint/`, `internal/`, `rules/`) directly into our repository under `v2/` namespaces. This eliminates the risk of introducing subtle bugs during manual refactoring and drastically reduces cognitive load.
 
-## 2. The Bridge Strategy: "Core-First" vs "Parser-First"
-Since we control the `Linter` engine, we can make it multilingual. The key insight is that `jhump` descriptors *can* expose their underlying `protoreflect` descriptors (or we can use adapters).
+**Trade-off:** This approach requires parsing the input proto files twice (once for V1, once for V2) until the migration is complete. We accept this runtime performance cost in exchange for engineering velocity and correctness.
 
-However, the cleanest path is to keep the **Parser** as `jhump` for now (legacy mode), but allow the **Linter Engine** to convert those descriptors to `protoreflect` when handing them to a "V2 Rule".
+## 2. Architecture
 
-### Architectural Diagram
+The CLI acts as the coordinator, managing two completely isolated linter stacks.
 
 ```mermaid
 graph TD
-    CLI["CLI (Parsing)"] -->|"desc.FileDescriptor"| Linter
-
-    subgraph "Hybrid Linter Engine"
-        Linter -->|"Check Rule Type"| TypeCheck{Is V2 Rule?}
-        
-        TypeCheck -- "No (Legacy)" --> V1Exec["Execute V1 Rule"]
-        V1Exec -->|"desc.Descriptor"| V1Rule["Old Rule Code"]
-        
-        TypeCheck -- "Yes (Modern)" --> Adapter["Adapter: jhump -> protoreflect"]
-        Adapter -->|"protoreflect.Descriptor"| V2Exec["Execute V2 Rule"]
-        V2Exec --> V2Rule["New Rule Code"]
+    UserConfig --> CLI
+    
+    subgraph "V1 Pipeline (Legacy - Frozen)"
+        CLI -->|Parse (jhump)| AST_V1[desc.FileDescriptor]
+        AST_V1 --> LinterV1
+        LinterV1 --> RulesV1[Legacy Rules]
     end
     
-    V1Rule --> Problems
-    V2Rule --> Problems
+    subgraph "V2 Pipeline (Modern - Active)"
+        CLI -->|Parse (protocompile)| AST_V2[protoreflect.FileDescriptor]
+        AST_V2 --> LinterV2
+        LinterV2 --> RulesV2[Modern Rules]
+    end
+    
+    LinterV1 -->|[]Problem| Merger
+    LinterV2 -->|[]Problem| Merger
+    Merger --> Output
 ```
 
-## 3. Phased Execution Plan
+## 3. Directory Structure
 
-### Phase 1: The Dual-Mode Core (The "Adapter")
-**Goal:** Allow defining a rule using `protoreflect` types.
+We will introduce `v2` packages to house the ported code.
 
-1.  **Define V2 Interfaces:** In `lint/rule.go`, define `NewProtoRule`, `NewMessageRule`, etc., (or simply `MessageRuleV2`) that accept functions with `protoreflect` signatures.
-    ```go
-    type MessageRuleV2 struct {
-        LintMessage func(protoreflect.MessageDescriptor) []Problem
-        // ...
-    }
-    ```
-2.  **Update `Problem` Struct:** `lint/problem.go` must hold *either* a `desc.Descriptor` (old) or a `protoreflect.Descriptor` (new).
-3.  **Update Linter Loop:** In `lint/lint.go`:
-    *   Iterate rules as usual.
-    *   If a rule implements the V2 interface:
-        *   Take the current `*desc.FileDescriptor`.
-        *   Call `.UnwrapFile()` (provided by jhump v1.15+) or cast to `protoreflect.FileDescriptor`.
-        *   Pass the unwrapped descriptor to the rule.
+```text
+api-linter/
+├── cmd/
+│   └── api-linter/
+│       └── cli.go        <-- UPDATED: Orchestrates both pipelines
+├── lint/                 <-- V1 Core (Legacy)
+├── lint/v2/              <-- V2 Core (Copied from upstream)
+├── internal/             <-- V1 Utils (Legacy)
+├── internal/v2/          <-- V2 Utils (Copied from upstream)
+├── rules/                <-- V1 Rules (Legacy)
+└── rules/v2/             <-- V2 Rules (Copied from upstream)
+```
 
-### Phase 2: The Utility Bridge
-**Goal:** Allow rule authors to write V2 rules without reimplementing every helper function.
+## 4. Execution Flow (CLI)
 
-1.  **Parallel Utils:** Create `rules/internal/utils/v2/` (or similar).
-2.  **Port Common Utils:** Copy the most critical functions (`IsResource`, `GetFieldBehavior`) to the new package, updated for `protoreflect`.
+1.  **Load Configuration:** Determine enabled/disabled rules.
+2.  **Phase 1 (V1):**
+    *   Parse files using `jhump/protoparse`.
+    *   Run `lint.New(...)`.
+    *   Collect `problemsV1`.
+    *   *Optimization:* Explicitly release V1 AST memory if possible (set to nil).
+3.  **Phase 2 (V2):**
+    *   Parse files using `bufbuild/protocompile` (logic copied from upstream `cli.go`).
+    *   Run `lint_v2.New(...)`.
+    *   Collect `problemsV2`.
+4.  **Merge:**
+    *   Combine `problemsV1` and `problemsV2`.
+    *   Sort by file and location.
+    *   Output results.
 
-### Phase 3: Incremental Rule Migration
-**Goal:** Migrate rules one AIP at a time.
+## 5. Migration Workflow (Per Rule)
 
-1.  **Pick a Victim:** Start with a simple AIP (e.g., AIP-0192).
-2.  **Refactor:** Rewrite `rules/aep0192/has_comments.go` to use `MessageRuleV2` and `protoreflect`.
-3.  **Test:** Update the rule's tests.
-    *   *Note:* Tests might need a similar adapter to parse test protos into `protoreflect` descriptors.
+To migrate a specific rule (e.g., `aep0122`):
 
-### Phase 4: Flip the Parser (The Final Switch)
-**Goal:** Remove `jhump` entirely.
+1.  **Copy:** Copy `rules/aep0122` from `original-api-linter` to `rules/v2/aep0122`.
+2.  **Disable V1:** Delete `rules/aep0122` (or disable it in the V1 registry) to prevent duplicate error reporting.
+3.  **Register V2:** Add the new V2 rule package to the V2 registry in `rules/v2/rules.go`.
 
-1.  **Switch CLI:** Replace `jhump/protoparse` with `bufbuild/protocompile` in `cmd/api-linter/cli.go`.
-2.  **Remove Adapter:** Now the Linter receives `protoreflect` descriptors natively.
-3.  **Retire V1:** Delete the V1 rule interfaces and the `Adapter` logic.
+## 6. Comparison with Hybrid Approach
 
-## 4. Implementation Refinements (Pilot Findings)
-During the pilot migration (see `docs/analysis/04-pilot-learnings.md`), we refined the design:
+| Feature | Hybrid (Adapter) | Dual Stack (Vendoring) |
+| :--- | :--- | :--- |
+| **Code Changes** | High (Rewrite rules & utils) | **Low** (Copy-paste upstream) |
+| **Risk** | High (Logic bugs) | **Low** (Proven code) |
+| **Runtime Perf** | Fast (Single Parse) | Slower (Double Parse) |
+| **Complexity** | High (Adapters, Generics) | Low (Two simple loops) |
 
-*   **CommonRule Interface:** We introduced a `CommonRule` interface because the `RuleRegistry` and `buf-plugin` need to handle both V1 and V2 rules in a single collection.
-*   **Adapter Logic:** We use `protodesc.NewFile` instead of `UnwrapFile` for broader compatibility, and lazy-load the V2 descriptor only when a V2 rule is active.
-*   **Dependency Resolution:** Tests for V2 rules need to manually register dependencies (like `aep/api/resource.proto`) into a `protoregistry` to convert descriptors successfully.
-
-## 5. Benefits of this Approach
-*   **Non-Blocking:** Multiple contributors can migrate different AIPs in parallel.
-*   **Safe:** We verify the "Core" changes first.
-*   **Shippable:** At no point is the linter broken. We can ship a release with 50% V1 rules and 50% V2 rules.
+This design prioritizes **safety and speed of implementation** over runtime performance.
