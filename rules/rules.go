@@ -53,7 +53,6 @@ import (
 	"github.com/aep-dev/api-linter/lint"
 	"github.com/aep-dev/api-linter/rules/aep0004"
 	"github.com/aep-dev/api-linter/rules/aep0121"
-	"github.com/aep-dev/api-linter/rules/aep0122"
 	"github.com/aep-dev/api-linter/rules/aep0126"
 	"github.com/aep-dev/api-linter/rules/aep0127"
 	"github.com/aep-dev/api-linter/rules/aep0131"
@@ -81,9 +80,9 @@ import (
 type addRulesFuncType func(lint.RuleRegistry) error
 
 var aepAddRulesFuncs = []addRulesFuncType{
-	aep0121.AddRules,
-	aep0122.AddRules,
 	aep0004.AddRules,
+	aep0121.AddRules,
+	// aep0122.AddRules, // Migrated to V2
 	aep0126.AddRules,
 	aep0127.AddRules,
 	aep0131.AddRules,

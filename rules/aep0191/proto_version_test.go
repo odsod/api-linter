@@ -41,7 +41,7 @@ func TestSyntax(t *testing.T) {
 			// Build an appropriate file descriptor.
 			f, err := builder.NewFile("library.proto").SetEdition(test.edition).Build()
 			if err != nil {
-				t.Fatalf("Could not build file descriptor.")
+				t.Fatalf("Could not build file descriptor: %v", err)
 			}
 			// Lint the file, and ensure we got the expected problems.
 			if diff := test.problems.SetDescriptor(f).Diff(syntax.Lint(f)); diff != "" {
